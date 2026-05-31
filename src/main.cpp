@@ -32,16 +32,6 @@ void IRAM_ATTR onLoRaRx() {
 
 uint32_t pktCount = 0;
 
-void powerOn() {
-  pinMode(PIN_VEXT, OUTPUT);
-  digitalWrite(PIN_VEXT, HIGH);
-  pinMode(PIN_TFT_BL, OUTPUT);
-  digitalWrite(PIN_TFT_BL, HIGH);
-  pinMode(PIN_VEXT_46, OUTPUT);
-  digitalWrite(PIN_VEXT_46, HIGH);
-  pinMode(PIN_VEXT_7, OUTPUT);
-  digitalWrite(PIN_VEXT_7, LOW);
-}
 
 void printLine(const char* text, uint16_t color = TFT_WHITE) {
   if (scrollY >= MAX_LINES * LINE_H) {
@@ -71,16 +61,22 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  powerOn();
-  delay(100);
+  // VTFT_CTRL: enable display power rail before SPI init (vendor sequence)
+  pinMode(PIN_VEXT_7, OUTPUT);
+  digitalWrite(PIN_VEXT_7, LOW);
+  delay(20);
 
-  // ── TFT init (TFT_eSPI handles its own SPI via build flags) ──
+  // ── TFT init ──
   tft.init();
   tft.setRotation(1);  // landscape: 320x170
   tft.setSwapBytes(true);
   tft.fillScreen(TFT_BLACK);
   tft.setTextSize(1);
   tft.setTextFont(2);
+
+  // Backlight ON after display init (matches vendor sequence)
+  pinMode(PIN_TFT_BL, OUTPUT);
+  digitalWrite(PIN_TFT_BL, HIGH);
 
   printLine("BluePawz LoRa Sniffer", TFT_CYAN);
   printLine("Heltec T190 VisionMaster", TFT_CYAN);
