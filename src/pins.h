@@ -20,3 +20,6 @@
 
 // User LED
 #define PIN_LED         35
+
+// User button (active LOW — connects GPIO to GND when pressed)
+#define PIN_BTN         21
