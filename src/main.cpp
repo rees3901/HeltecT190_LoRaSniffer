@@ -68,8 +68,11 @@ void setup() {
   delay(300);
   Serial.println("[T190] LoRa Sniffer starting...");
 
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
   powerOn();
-  delay(50);
+  delay(100);
 
   // ── TFT init (TFT_eSPI handles its own SPI via build flags) ──
   tft.init();
@@ -184,6 +187,15 @@ void handlePacket() {
 }
 
 void loop() {
+  // Heartbeat — blinks LED every 500 ms to confirm firmware is running
+  static uint32_t lastBlink = 0;
+  static bool ledState = false;
+  if (millis() - lastBlink >= 500) {
+    lastBlink = millis();
+    ledState = !ledState;
+    digitalWrite(PIN_LED, ledState);
+  }
+
   if (gotPacket) {
     gotPacket = false;
     handlePacket();
