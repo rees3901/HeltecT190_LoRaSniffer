@@ -13,6 +13,17 @@
 #define LORA_PREAMBLE   16
 #define LORA_SYNC_WORD  0x12
 
+
+
+#define st7789_CS_Pin 39
+#define st7789_REST_Pin 40
+#define st7789_DC_Pin 47
+#define st7789_SCLK_Pin 38
+#define st7789_MOSI_Pin 48
+#define st7789_LED_K_Pin 17
+#define st7789_VTFT_CTRL_Pin 7
+
+
 // ── Display ──
 TFT_eSPI tft;
 int scrollY = 0;
