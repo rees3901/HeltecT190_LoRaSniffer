@@ -81,11 +81,6 @@ const uint32_t DBL_CLICK_MS = 350;   // window to catch a second click
 bool     clickPending = false;
 uint32_t firstClickMs = 0;
 
-// ── Packet activity LED flash ──
-uint8_t  flashBlinks = 0;                // remaining LED toggles for the flicker
-const uint32_t FLASH_INTERVAL_MS = 40;   // toggle period during the flicker
-const uint8_t  FLASH_TOGGLES = 6;        // 6 toggles = ~3 quick flashes
-
 // ── LoRa on HSPI (SPI3) ── TFT uses default SPI (SPI2/FSPI)
 SPIClass LoRaSPI(HSPI);
 SX1262 lora = new Module(LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN, LoRaSPI);
@@ -381,9 +376,6 @@ void handlePacket() {
     return;
   }
 
-  // Flash the LED to signal a fresh packet
-  flashBlinks = FLASH_TOGGLES;
-
   // Store in ring buffer
   pktCount++;
   msgHead = (msgHead + 1) % MSG_HISTORY;
@@ -418,20 +410,10 @@ void handlePacket() {
 
 // ── Main loop ──
 void loop() {
-  // LED: rapid flicker on each new packet, slow heartbeat when idle
+  // Heartbeat LED
   static uint32_t lastBlink = 0;
   static bool ledState = false;
-  if (flashBlinks > 0) {
-    if (millis() - lastBlink >= FLASH_INTERVAL_MS) {
-      lastBlink = millis();
-      ledState = !ledState;
-      digitalWrite(PIN_LED, ledState);
-      if (--flashBlinks == 0) {            // end the burst with the LED off
-        ledState = false;
-        digitalWrite(PIN_LED, LOW);
-      }
-    }
-  } else if (millis() - lastBlink >= 500) {
+  if (millis() - lastBlink >= 500) {
     lastBlink = millis();
     ledState = !ledState;
     digitalWrite(PIN_LED, ledState);
