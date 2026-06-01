@@ -7,9 +7,9 @@
 #include "pins.h"
 
 // ── BluePawz protocol ──
-#define LORA_FREQ       915.0
-#define LORA_SF         8
-#define LORA_BW         250.0
+#define LORA_FREQ       868.0
+#define LORA_SF         9
+#define LORA_BW         125.0
 #define LORA_CR         5
 #define LORA_PREAMBLE   16
 #define LORA_SYNC_WORD  0x12
