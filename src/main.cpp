@@ -26,14 +26,21 @@
 
 // ── Display ──
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
-const int LINE_H   = 16;
-const int SCREEN_W = 320;
-const int SCREEN_H = 170;
-const int MAX_LINES = SCREEN_H / LINE_H;  // 10 lines
+const int LINE_H      = 16;
+const int SCREEN_W    = 320;
+const int SCREEN_H    = 170;
+const int STATUS_H    = 14;                     // bottom status-bar height (px)
+const int BODY_BOTTOM = SCREEN_H - STATUS_H;    // payload text must stay above this
+const int MAX_LINES   = SCREEN_H / LINE_H;      // 10 lines (used by boot splash)
+
+// "Collar quiet" warning threshold. The collar's TX cadence is mode-dependent
+// (normal 300s, active 60s, lost 30s), so this is a coarse heartbeat hint only.
+const uint32_t QUIET_S = 120;
 
 // ── Message history ring buffer ──
 struct MsgRecord {
   uint32_t num;
+  uint32_t ms;        // millis() at reception (for "age")
   float    rssi, snr;
   String   payload;
 };
@@ -42,8 +49,10 @@ const int MSG_HISTORY = 10;
 MsgRecord msgBuf[MSG_HISTORY];
 int      msgCount  = 0;   // messages stored so far (caps at MSG_HISTORY)
 int      msgHead   = -1;  // ring buffer index of newest message
-int      viewOff   = 0;   // 0 = newest, 1 = one older, etc.
-uint32_t pktCount  = 0;
+int      viewOff   = 0;   // 0 = newest (LIVE), >0 = older (FROZEN)
+uint32_t pktCount  = 0;   // good packets received
+uint32_t errCount  = 0;   // CRC mismatches + RX errors
+uint32_t lastPktMs = 0;   // millis() of most recent good packet
 
 // ── Button debounce ──
 bool     lastBtnState = HIGH;
@@ -81,6 +90,32 @@ void printLinef(uint16_t color, const char* fmt, ...) {
   printLine(buf, color);
 }
 
+// ── Bottom status bar: LIVE/FROZEN state, packet age, good/error counts ──
+void drawStatusBar() {
+  tft.fillRect(0, BODY_BOTTOM, SCREEN_W, STATUS_H, ST77XX_BLACK);
+  tft.setTextSize(1);
+
+  char buf[64];
+  uint16_t col;
+  if (viewOff == 0) {
+    uint32_t age = (lastPktMs == 0) ? 0 : (millis() - lastPktMs) / 1000;
+    col = (age > QUIET_S) ? ST77XX_RED
+        : (age > QUIET_S / 2) ? ST77XX_YELLOW
+        : ST77XX_GREEN;
+    snprintf(buf, sizeof(buf), "LIVE  age:%lus  ok:%lu err:%lu",
+             (unsigned long)age, (unsigned long)pktCount, (unsigned long)errCount);
+  } else {
+    col = ST77XX_CYAN;
+    snprintf(buf, sizeof(buf), "FROZEN %d/%d  ok:%lu err:%lu",
+             viewOff + 1, msgCount, (unsigned long)pktCount, (unsigned long)errCount);
+  }
+
+  tft.setTextColor(col, ST77XX_BLACK);
+  tft.setCursor(2, BODY_BOTTOM + 3);
+  tft.print(buf);
+  tft.setTextSize(2);   // restore body text size
+}
+
 // ── Render one message from history ──
 void renderMessage(int offset) {
   if (msgCount == 0) return;
@@ -91,43 +126,52 @@ void renderMessage(int offset) {
   tft.fillScreen(ST77XX_BLACK);
   scrollY = 0;
 
-  // Header: packet info + position in history
-  // e.g.  "#42 R:-87 S:3.1  1/7"
-  printLinef(ST77XX_YELLOW, "#%lu R:%.0f S:%.1f  %d/%d",
-             m.num, m.rssi, m.snr, offset + 1, msgCount);
-
-  // Parse payload
+  // Parse once, up front, so we can tag the header by direction.
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, m.payload);
+  bool parsed = !err;
+  // A "cmd" key means the base station is talking TO the collar (downlink).
+  // Anything else (status/ack/pong/telemetry) is the collar talking back (uplink).
+  bool isCmd = parsed && !doc["cmd"].isNull();
 
-  if (!err) {
+  const char* tag;
+  uint16_t    hcol;
+  if (!parsed)    { tag = "? RAW";  hcol = ST77XX_MAGENTA; }
+  else if (isCmd) { tag = "DN CMD"; hcol = ST77XX_ORANGE; }  // base -> collar
+  else            { tag = "UP TLM"; hcol = ST77XX_GREEN; }   // collar -> base
+
+  printLinef(hcol, "%s #%lu R:%.0f S:%.1f", tag, m.num, m.rssi, m.snr);
+
+  if (parsed) {
     JsonObject obj = doc.as<JsonObject>();
     for (JsonPair kv : obj) {
+      if (scrollY + LINE_H > BODY_BOTTOM) break;
       char line[64];
-      if (kv.value().is<float>() || kv.value().is<double>()) {
-        snprintf(line, sizeof(line), "%s:%.4f", kv.key().c_str(), kv.value().as<float>());
+      if (kv.value().is<bool>()) {
+        snprintf(line, sizeof(line), "%s:%s", kv.key().c_str(), kv.value().as<bool>() ? "true" : "false");
       } else if (kv.value().is<int>()) {
         snprintf(line, sizeof(line), "%s:%d", kv.key().c_str(), kv.value().as<int>());
-      } else if (kv.value().is<bool>()) {
-        snprintf(line, sizeof(line), "%s:%s", kv.key().c_str(), kv.value().as<bool>() ? "true" : "false");
+      } else if (kv.value().is<float>() || kv.value().is<double>()) {
+        snprintf(line, sizeof(line), "%s:%.4f", kv.key().c_str(), kv.value().as<float>());
       } else if (kv.value().is<const char*>()) {
         snprintf(line, sizeof(line), "%s:%s", kv.key().c_str(), kv.value().as<const char*>());
       } else {
         snprintf(line, sizeof(line), "%s:[?]", kv.key().c_str());
       }
       printLine(line, ST77XX_WHITE);
-      if (scrollY >= MAX_LINES * LINE_H) break;
     }
   } else {
     // Raw payload — wrap at 26 chars (textSize 2, 320px wide)
     printLine("(raw)", ST77XX_MAGENTA);
     int pos = 0;
-    while (pos < (int)m.payload.length() && scrollY < MAX_LINES * LINE_H) {
+    while (pos < (int)m.payload.length() && scrollY + LINE_H <= BODY_BOTTOM) {
       String chunk = m.payload.substring(pos, pos + 26);
       printLine(chunk.c_str(), ST77XX_WHITE);
       pos += 26;
     }
   }
+
+  drawStatusBar();
 }
 
 // ── Setup ──
@@ -183,6 +227,7 @@ void setup() {
   lora.startReceive();
 
   printLine("Radio OK - listening", ST77XX_GREEN);
+  drawStatusBar();
   Serial.println("[LoRa] Sniffer ready");
 }
 
@@ -196,11 +241,10 @@ void handlePacket() {
   lora.startReceive();
 
   if (state != RADIOLIB_ERR_NONE) {
-    if (state == RADIOLIB_ERR_CRC_MISMATCH) {
-      printLine("CRC error", ST77XX_RED);
-    } else {
-      printLinef(ST77XX_RED, "RX err: %d", state);
-    }
+    errCount++;
+    if (state == RADIOLIB_ERR_CRC_MISMATCH) Serial.println("[LoRa] CRC mismatch");
+    else                                    Serial.printf("[LoRa] RX err: %d\n", state);
+    drawStatusBar();   // reflect error count without disturbing the message view
     return;
   }
 
@@ -209,18 +253,25 @@ void handlePacket() {
   msgHead = (msgHead + 1) % MSG_HISTORY;
   if (msgCount < MSG_HISTORY) msgCount++;
   msgBuf[msgHead].num     = pktCount;
+  msgBuf[msgHead].ms      = millis();
   msgBuf[msgHead].rssi    = rssi;
   msgBuf[msgHead].snr     = snr;
   msgBuf[msgHead].payload = incoming;
+  lastPktMs = millis();
 
   // Serial log
   Serial.printf("\n==== Pkt #%lu  RSSI:%.1f  SNR:%.1f ====\n",
                 pktCount, rssi, snr);
   Serial.println(incoming);
 
-  // Snap view to newest and render
-  viewOff = 0;
-  renderMessage(0);
+  if (viewOff == 0) {
+    renderMessage(0);                          // live view: jump to newest
+  } else {
+    // User is browsing history — keep their message on screen. The head just
+    // advanced, so bump viewOff to keep pointing at the same physical message.
+    if (viewOff < msgCount - 1) viewOff++;
+    drawStatusBar();                           // refresh FROZEN position only
+  }
 }
 
 // ── Main loop ──
@@ -232,6 +283,13 @@ void loop() {
     lastBlink = millis();
     ledState = !ledState;
     digitalWrite(PIN_LED, ledState);
+  }
+
+  // Tick the status bar ~1Hz so the "age" counter advances live
+  static uint32_t lastStatusMs = 0;
+  if (millis() - lastStatusMs >= 1000) {
+    lastStatusMs = millis();
+    drawStatusBar();
   }
 
   // Button: cycle history on falling edge with debounce
