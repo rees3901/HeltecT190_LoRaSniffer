@@ -32,10 +32,19 @@ const int SCREEN_H    = 170;
 const int STATUS_H    = 14;                     // bottom status-bar height (px)
 const int BODY_BOTTOM = SCREEN_H - STATUS_H;    // payload text must stay above this
 const int MAX_LINES   = SCREEN_H / LINE_H;      // 10 lines (used by boot splash)
+const int SUMMARY_ROWS_Y = 3 * LINE_H;          // device tally starts here (y=48)
 
-// "Collar quiet" warning threshold. The collar's TX cadence is mode-dependent
-// (normal 300s, active 60s, lost 30s), so this is a coarse heartbeat hint only.
+// "Collar quiet" warning threshold for the status bar. The collar's TX cadence
+// is mode-dependent (normal 300s, active 60s, lost 30s), coarse hint only.
 const uint32_t QUIET_S = 120;
+
+// Per-device freshness thresholds (seconds) for the summary tally colours.
+const uint32_t FRESH_GREEN_S  = 300;   // < 5 min  -> green
+const uint32_t FRESH_YELLOW_S = 600;   // < 10 min -> yellow, older -> red
+
+// ── View modes ──
+enum ViewMode { VIEW_HISTORY, VIEW_SUMMARY };
+ViewMode viewMode = VIEW_HISTORY;
 
 // ── Message history ring buffer ──
 struct MsgRecord {
@@ -54,10 +63,23 @@ uint32_t pktCount  = 0;   // good packets received
 uint32_t errCount  = 0;   // CRC mismatches + RX errors
 uint32_t lastPktMs = 0;   // millis() of most recent good packet
 
-// ── Button debounce ──
+// ── Per-device tally (for summary page) ──
+const int MAX_DEVICES = 6;             // fits the summary rows (y=48..140)
+struct DevStat {
+  char     id[16];
+  uint32_t count;
+  uint32_t lastMs;
+};
+DevStat devs[MAX_DEVICES];
+int devCount = 0;
+
+// ── Button: single vs double click ──
 bool     lastBtnState = HIGH;
 uint32_t lastBtnMs    = 0;
-const uint32_t DEBOUNCE_MS = 200;
+const uint32_t DEBOUNCE_MS  = 200;
+const uint32_t DBL_CLICK_MS = 350;   // window to catch a second click
+bool     clickPending = false;
+uint32_t firstClickMs = 0;
 
 // ── LoRa on HSPI (SPI3) ── TFT uses default SPI (SPI2/FSPI)
 SPIClass LoRaSPI(HSPI);
@@ -90,18 +112,67 @@ void printLinef(uint16_t color, const char* fmt, ...) {
   printLine(buf, color);
 }
 
-// ── Bottom status bar: LIVE/FROZEN state, packet age, good/error counts ──
+// Green <5min, yellow <10min, red older.
+uint16_t freshColor(uint32_t lastMs) {
+  uint32_t age = (millis() - lastMs) / 1000;
+  if (age < FRESH_GREEN_S)  return ST77XX_GREEN;
+  if (age < FRESH_YELLOW_S) return ST77XX_YELLOW;
+  return ST77XX_RED;
+}
+
+// "45s" under a minute, otherwise "12m".
+void fmtAge(uint32_t lastMs, char* out, size_t n) {
+  uint32_t age = (millis() - lastMs) / 1000;
+  if (age < 60) snprintf(out, n, "%lus", (unsigned long)age);
+  else          snprintf(out, n, "%lum", (unsigned long)(age / 60));
+}
+
+// Pull a device identity from a parsed payload and fold it into the tally.
+// Telemetry uses "id", status/pong/ack use "device", with "device_id" (int)
+// as a last resort. Packets with no identity still count toward pktCount.
+void tallyDevice(JsonDocument& doc) {
+  const char* id = nullptr;
+  char tmp[16];
+  if (doc["id"].is<const char*>())          id = doc["id"];
+  else if (doc["device"].is<const char*>()) id = doc["device"];
+  else if (doc["device_id"].is<int>()) {
+    snprintf(tmp, sizeof(tmp), "#%d", doc["device_id"].as<int>());
+    id = tmp;
+  }
+  if (!id || !id[0]) return;
+
+  for (int i = 0; i < devCount; i++) {
+    if (strncmp(devs[i].id, id, sizeof(devs[i].id)) == 0) {
+      devs[i].count++;
+      devs[i].lastMs = millis();
+      return;
+    }
+  }
+  if (devCount < MAX_DEVICES) {
+    strncpy(devs[devCount].id, id, sizeof(devs[devCount].id) - 1);
+    devs[devCount].id[sizeof(devs[devCount].id) - 1] = '\0';
+    devs[devCount].count  = 1;
+    devs[devCount].lastMs = millis();
+    devCount++;
+  }
+  // Table full + new device: silently ignored (rare for this fleet).
+}
+
+// ── Bottom status bar: view state, packet age, good/error counts ──
 void drawStatusBar() {
   tft.fillRect(0, BODY_BOTTOM, SCREEN_W, STATUS_H, ST77XX_BLACK);
   tft.setTextSize(1);
 
   char buf[64];
   uint16_t col;
-  if (viewOff == 0) {
+  if (viewMode == VIEW_SUMMARY) {
     uint32_t age = (lastPktMs == 0) ? 0 : (millis() - lastPktMs) / 1000;
-    col = (age > QUIET_S) ? ST77XX_RED
-        : (age > QUIET_S / 2) ? ST77XX_YELLOW
-        : ST77XX_GREEN;
+    col = (age > QUIET_S) ? ST77XX_RED : (age > QUIET_S / 2) ? ST77XX_YELLOW : ST77XX_GREEN;
+    snprintf(buf, sizeof(buf), "SUMMARY  age:%lus  ok:%lu err:%lu",
+             (unsigned long)age, (unsigned long)pktCount, (unsigned long)errCount);
+  } else if (viewOff == 0) {
+    uint32_t age = (lastPktMs == 0) ? 0 : (millis() - lastPktMs) / 1000;
+    col = (age > QUIET_S) ? ST77XX_RED : (age > QUIET_S / 2) ? ST77XX_YELLOW : ST77XX_GREEN;
     snprintf(buf, sizeof(buf), "LIVE  age:%lus  ok:%lu err:%lu",
              (unsigned long)age, (unsigned long)pktCount, (unsigned long)errCount);
   } else {
@@ -116,6 +187,43 @@ void drawStatusBar() {
   tft.setTextSize(2);   // restore body text size
 }
 
+// ── Summary page: device tally rows (drawn from SUMMARY_ROWS_Y down) ──
+void drawDeviceRows() {
+  tft.setTextSize(2);
+  scrollY = SUMMARY_ROWS_Y;
+  if (devCount == 0) {
+    printLine("(no devices yet)", ST77XX_WHITE);
+    return;
+  }
+  for (int i = 0; i < devCount; i++) {
+    if (scrollY + LINE_H > BODY_BOTTOM) break;
+    char age[8];
+    fmtAge(devs[i].lastMs, age, sizeof(age));
+    char line[40];
+    snprintf(line, sizeof(line), "%-8s x%lu %s",
+             devs[i].id, (unsigned long)devs[i].count, age);
+    printLine(line, freshColor(devs[i].lastMs));
+  }
+}
+
+void renderSummary() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  scrollY = 0;
+  printLine("== SUMMARY ==", ST77XX_CYAN);
+  printLinef(ST77XX_YELLOW, "%.0fMHz SF%d BW%.0fk", LORA_FREQ, LORA_SF, LORA_BW);
+  printLinef(ST77XX_WHITE, "Pkts:%lu Err:%lu", (unsigned long)pktCount, (unsigned long)errCount);
+  drawDeviceRows();
+  drawStatusBar();
+}
+
+// Repaint just the device-tally band so ages/colours stay live without
+// flickering the static header.
+void refreshSummaryRows() {
+  tft.fillRect(0, SUMMARY_ROWS_Y, SCREEN_W, BODY_BOTTOM - SUMMARY_ROWS_Y, ST77XX_BLACK);
+  drawDeviceRows();
+}
+
 // ── Render one message from history ──
 void renderMessage(int offset) {
   if (msgCount == 0) return;
@@ -124,6 +232,7 @@ void renderMessage(int offset) {
   MsgRecord& m = msgBuf[idx];
 
   tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
   scrollY = 0;
 
   // Parse once, up front, so we can tag the header by direction.
@@ -174,6 +283,25 @@ void renderMessage(int offset) {
   drawStatusBar();
 }
 
+// ── Button actions ──
+void onSingleClick() {
+  if (viewMode == VIEW_SUMMARY) {
+    viewMode = VIEW_HISTORY;        // leave summary, back to history
+    renderMessage(viewOff);
+    Serial.println("[BTN] -> history");
+  } else if (msgCount > 0) {
+    viewOff = (viewOff + 1) % msgCount;
+    renderMessage(viewOff);
+    Serial.printf("[BTN] viewing msg %d/%d\n", viewOff + 1, msgCount);
+  }
+}
+
+void onDoubleClick() {
+  viewMode = VIEW_SUMMARY;
+  renderSummary();
+  Serial.println("[BTN] -> summary");
+}
+
 // ── Setup ──
 void setup() {
   Serial.begin(115200);
@@ -204,7 +332,7 @@ void setup() {
   printLine("BluePawz LoRa Sniffer", ST77XX_CYAN);
   printLine("Heltec T190", ST77XX_CYAN);
   printLinef(ST77XX_YELLOW, "%.0fMHz SF%d BW%.0fk", LORA_FREQ, LORA_SF, LORA_BW);
-  printLine("Btn=cycle history", ST77XX_WHITE);
+  printLine("1x=history 2x=summary", ST77XX_WHITE);
   printLine("Waiting...", ST77XX_GREEN);
 
   // LoRa on HSPI
@@ -244,7 +372,7 @@ void handlePacket() {
     errCount++;
     if (state == RADIOLIB_ERR_CRC_MISMATCH) Serial.println("[LoRa] CRC mismatch");
     else                                    Serial.printf("[LoRa] RX err: %d\n", state);
-    drawStatusBar();   // reflect error count without disturbing the message view
+    drawStatusBar();   // reflect error count without disturbing the view
     return;
   }
 
@@ -259,12 +387,18 @@ void handlePacket() {
   msgBuf[msgHead].payload = incoming;
   lastPktMs = millis();
 
+  // Update per-device tally
+  JsonDocument tdoc;
+  if (deserializeJson(tdoc, incoming) == DeserializationError::Ok) tallyDevice(tdoc);
+
   // Serial log
   Serial.printf("\n==== Pkt #%lu  RSSI:%.1f  SNR:%.1f ====\n",
                 pktCount, rssi, snr);
   Serial.println(incoming);
 
-  if (viewOff == 0) {
+  if (viewMode == VIEW_SUMMARY) {
+    renderSummary();                           // counts/devices changed
+  } else if (viewOff == 0) {
     renderMessage(0);                          // live view: jump to newest
   } else {
     // User is browsing history — keep their message on screen. The head just
@@ -285,24 +419,37 @@ void loop() {
     digitalWrite(PIN_LED, ledState);
   }
 
-  // Tick the status bar ~1Hz so the "age" counter advances live
+  // ~1Hz tick: advance "age" counters / colours on whichever page is showing
   static uint32_t lastStatusMs = 0;
   if (millis() - lastStatusMs >= 1000) {
     lastStatusMs = millis();
+    if (viewMode == VIEW_SUMMARY) refreshSummaryRows();
     drawStatusBar();
   }
 
-  // Button: cycle history on falling edge with debounce
+  // Button: detect single vs double click on falling edge (with debounce).
+  // A single click is deferred until the double-click window closes so the
+  // two gestures don't collide.
   bool btnNow = digitalRead(PIN_BTN);
   if (lastBtnState == HIGH && btnNow == LOW) {
-    if (millis() - lastBtnMs >= DEBOUNCE_MS && msgCount > 0) {
+    if (millis() - lastBtnMs >= DEBOUNCE_MS) {
       lastBtnMs = millis();
-      viewOff = (viewOff + 1) % msgCount;
-      renderMessage(viewOff);
-      Serial.printf("[BTN] viewing msg %d/%d\n", viewOff + 1, msgCount);
+      if (clickPending && (millis() - firstClickMs) <= DBL_CLICK_MS) {
+        clickPending = false;
+        onDoubleClick();
+      } else {
+        clickPending = true;
+        firstClickMs = millis();
+      }
     }
   }
   lastBtnState = btnNow;
+
+  // Resolve a pending single click once the double-click window expires
+  if (clickPending && (millis() - firstClickMs) > DBL_CLICK_MS) {
+    clickPending = false;
+    onSingleClick();
+  }
 
   // LoRa packet
   if (gotPacket) {
