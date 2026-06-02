@@ -88,6 +88,19 @@ SX1262 lora = new Module(LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PI
 volatile bool gotPacket = false;
 void IRAM_ATTR onLoRaRx() { gotPacket = true; }
 
+// Quick 5-blink flicker to signal a freshly received packet. Blocking (~500ms),
+// which is fine given how infrequently the collar transmits.
+void LED_flicker()
+{
+  for (int i = 0; i < 5; i++)
+  {
+    digitalWrite(LORA_LED, HIGH);
+    delay(50);
+    digitalWrite(LORA_LED, LOW);
+    delay(50);
+  }
+}
+
 // ── Helpers ──
 
 int scrollY = 0;
@@ -311,6 +324,9 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
+  pinMode(LORA_LED, OUTPUT);
+  digitalWrite(LORA_LED, LOW);
+
   pinMode(PIN_BTN, INPUT_PULLUP);
 
   // Display power then init
@@ -406,6 +422,8 @@ void handlePacket() {
     if (viewOff < msgCount - 1) viewOff++;
     drawStatusBar();                           // refresh FROZEN position only
   }
+
+  LED_flicker();                               // notify user of the new packet
 }
 
 // ── Main loop ──
