@@ -21,9 +21,9 @@
 // User LED
 #define PIN_LED         35
 
-// Packet-activity LED. GPIO0 is the boot strapping pin / boot button; it is
-// only driven as an output after boot, so normal boot is unaffected.
-#define LORA_LED        0
+// Previous-page button. GPIO0 is the boot strapping pin / boot (PRG) button;
+// read as a normal active-low input after boot.
+#define BOOT_BTN        0
 
 // User button (active LOW — connects GPIO to GND when pressed)
 #define PIN_BTN         21

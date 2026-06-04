@@ -73,13 +73,22 @@ struct DevStat {
 DevStat devs[MAX_DEVICES];
 int devCount = 0;
 
-// ── Button: single vs double click ──
-bool     lastBtnState = HIGH;
-uint32_t lastBtnMs    = 0;
+// ── Buttons: two-way page navigation ──
+// User button = next page, boot button (GPIO0) = previous page.
+// Double-press on either returns to the summary page.
 const uint32_t DEBOUNCE_MS  = 200;
-const uint32_t DBL_CLICK_MS = 350;   // window to catch a second click
-bool     clickPending = false;
-uint32_t firstClickMs = 0;
+const uint32_t DBL_CLICK_MS = 350;   // window to catch a second press
+
+struct Button {
+  uint8_t  pin;
+  bool     isNext;        // true = next page, false = previous page
+  bool     lastState;
+  uint32_t lastEdgeMs;
+  bool     clickPending;
+  uint32_t firstClickMs;
+};
+Button btnUser = { PIN_BTN,  true,  HIGH, 0, false, 0 };
+Button btnBoot = { BOOT_BTN, false, HIGH, 0, false, 0 };
 
 // ── LoRa on HSPI (SPI3) ── TFT uses default SPI (SPI2/FSPI)
 SPIClass LoRaSPI(HSPI);
@@ -88,15 +97,16 @@ SX1262 lora = new Module(LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PI
 volatile bool gotPacket = false;
 void IRAM_ATTR onLoRaRx() { gotPacket = true; }
 
-// Quick 5-blink flicker to signal a freshly received packet. Blocking (~500ms),
-// which is fine given how infrequently the collar transmits.
+// Flash the TFT backlight 5x to signal a freshly received packet. Blocking
+// (~500ms), fine given how infrequently the collar transmits. The backlight is
+// active-high and normally on, so we blink it off->on and leave it on.
 void LED_flicker()
 {
   for (int i = 0; i < 5; i++)
   {
-    digitalWrite(LORA_LED, HIGH);
+    digitalWrite(TFT_BL, LOW);    // backlight off
     delay(50);
-    digitalWrite(LORA_LED, LOW);
+    digitalWrite(TFT_BL, HIGH);   // backlight on
     delay(50);
   }
 }
@@ -297,22 +307,50 @@ void renderMessage(int offset) {
 }
 
 // ── Button actions ──
-void onSingleClick() {
-  if (viewMode == VIEW_SUMMARY) {
-    viewMode = VIEW_HISTORY;        // leave summary, back to history
-    renderMessage(viewOff);
-    Serial.println("[BTN] -> history");
-  } else if (msgCount > 0) {
-    viewOff = (viewOff + 1) % msgCount;
-    renderMessage(viewOff);
-    Serial.printf("[BTN] viewing msg %d/%d\n", viewOff + 1, msgCount);
-  }
-}
-
-void onDoubleClick() {
+void onSummary() {
   viewMode = VIEW_SUMMARY;
   renderSummary();
   Serial.println("[BTN] -> summary");
+}
+
+// Step through history. dir +1 = next (older), -1 = previous (newer). From the
+// summary page, the first press just returns to history at the current position.
+void stepPage(int dir) {
+  if (viewMode == VIEW_SUMMARY) {
+    viewMode = VIEW_HISTORY;
+    renderMessage(viewOff);
+    Serial.println("[BTN] -> history");
+    return;
+  }
+  if (msgCount == 0) return;
+  viewOff = (viewOff + dir + msgCount) % msgCount;
+  renderMessage(viewOff);
+  Serial.printf("[BTN] viewing msg %d/%d\n", viewOff + 1, msgCount);
+}
+
+// Service one button: single press steps a page (next/prev), double press jumps
+// to the summary. The single press is deferred until the double-press window
+// closes so the two gestures don't collide.
+void serviceButton(Button& b) {
+  bool now = digitalRead(b.pin);
+  if (b.lastState == HIGH && now == LOW) {            // falling edge = press
+    if (millis() - b.lastEdgeMs >= DEBOUNCE_MS) {
+      b.lastEdgeMs = millis();
+      if (b.clickPending && (millis() - b.firstClickMs) <= DBL_CLICK_MS) {
+        b.clickPending = false;
+        onSummary();
+      } else {
+        b.clickPending = true;
+        b.firstClickMs = millis();
+      }
+    }
+  }
+  b.lastState = now;
+
+  if (b.clickPending && (millis() - b.firstClickMs) > DBL_CLICK_MS) {
+    b.clickPending = false;
+    stepPage(b.isNext ? +1 : -1);
+  }
 }
 
 // ── Setup ──
@@ -324,10 +362,8 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  pinMode(LORA_LED, OUTPUT);
-  digitalWrite(LORA_LED, LOW);
-
-  pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_BTN,  INPUT_PULLUP);   // user button = next page
+  pinMode(BOOT_BTN, INPUT_PULLUP);   // boot button = previous page
 
   // Display power then init
   pinMode(TFT_VCtrl, OUTPUT);
@@ -348,7 +384,7 @@ void setup() {
   printLine("BluePawz LoRa Sniffer", ST77XX_CYAN);
   printLine("Heltec T190", ST77XX_CYAN);
   printLinef(ST77XX_YELLOW, "%.0fMHz SF%d BW%.0fk", LORA_FREQ, LORA_SF, LORA_BW);
-  printLine("1x=history 2x=summary", ST77XX_WHITE);
+  printLine("Btns:next/prev 2x=sum", ST77XX_WHITE);
   printLine("Waiting...", ST77XX_GREEN);
 
   // LoRa on HSPI
@@ -445,29 +481,9 @@ void loop() {
     drawStatusBar();
   }
 
-  // Button: detect single vs double click on falling edge (with debounce).
-  // A single click is deferred until the double-click window closes so the
-  // two gestures don't collide.
-  bool btnNow = digitalRead(PIN_BTN);
-  if (lastBtnState == HIGH && btnNow == LOW) {
-    if (millis() - lastBtnMs >= DEBOUNCE_MS) {
-      lastBtnMs = millis();
-      if (clickPending && (millis() - firstClickMs) <= DBL_CLICK_MS) {
-        clickPending = false;
-        onDoubleClick();
-      } else {
-        clickPending = true;
-        firstClickMs = millis();
-      }
-    }
-  }
-  lastBtnState = btnNow;
-
-  // Resolve a pending single click once the double-click window expires
-  if (clickPending && (millis() - firstClickMs) > DBL_CLICK_MS) {
-    clickPending = false;
-    onSingleClick();
-  }
+  // Two-button navigation: user = next, boot (GPIO0) = previous, double = summary
+  serviceButton(btnUser);
+  serviceButton(btnBoot);
 
   // LoRa packet
   if (gotPacket) {
